@@ -1,0 +1,73 @@
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.3
+    container_name: local-bi-clickhouse
+    environment:
+      CLICKHOUSE_DB: analytics
+      CLICKHOUSE_USER: bi
+      CLICKHOUSE_PASSWORD: local-bi-password
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./infra/clickhouse/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--user", "bi", "--password", "local-bi-password", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  postgres:
+    image: postgres:17-alpine
+    container_name: local-bi-postgres
+    environment:
+      POSTGRES_DB: local_bi
+      POSTGRES_USER: local_bi
+      POSTGRES_PASSWORD: local-bi-password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U local_bi -d local_bi"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile.dev
+    container_name: local-bi-api
+    environment:
+      PORT: 3001
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DATABASE: analytics
+      CLICKHOUSE_USER: bi
+      CLICKHOUSE_PASSWORD: local-bi-password
+      DATABASE_URL: postgres://local_bi:local-bi-password@postgres:5432/local_bi
+      SEED_DEMO_DATA: "true"
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./apps/api:/workspace/apps/api
+      - ./infra/clickhouse:/workspace/infra/clickhouse:ro
+      - ./infra/clickhouse/seeds:/workspace/infra/clickhouse/seeds:ro
+      - api-node-modules:/workspace/node_modules
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  clickhouse-data:
+  postgres-data:
+  api-node-modules:

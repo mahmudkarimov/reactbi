@@ -1,0 +1,19 @@
+{
+  "name": "@local-bi/api",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts"
+  },
+  "dependencies": {
+    "@clickhouse/client": "^1.25.0",
+    "fastify": "^5.12.7",
+    "pg": "^8.16.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "@types/pg": "^8.15.5",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}
