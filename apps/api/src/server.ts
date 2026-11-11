@@ -29,14 +29,19 @@ type ChartSpecV2 = {
     series?: { field: string; fields?: string[] };
   };
   sortBy: 'dimension' | 'value';
+  sortField?: string;
   chartType: ChartType;
-  filter?: { field: string; value: string };
+  filter?: { field: string; value?: string; values?: string[] };
   displayTitle?: string;
   valueFormat?: 'number' | 'currency' | 'percent';
   currencyCode?: 'USD' | 'SGD' | 'EUR' | 'GBP';
   palette?: 'sage' | 'ocean' | 'sunset' | 'berry';
   showGrid?: boolean;
   showLegend?: boolean;
+  showDataLabels?: boolean;
+  smoothLines?: boolean;
+  stackSeries?: boolean;
+  alternateYCategories?: string[];
 };
 type LegacyChartSpec = {
   table: string; dimension: string; measure: string; aggregation: Aggregation;
@@ -50,8 +55,8 @@ type ChartSpec = ChartSpecV2 | LegacyChartSpec;
 type NormalizedSpec = {
   table: string; xDimensions: string[]; yDimensions: string[]; dateBucket: DateBucket;
   measures: AggregatedField[]; seriesDimensions: string[];
-  sortBy: 'dimension' | 'value'; chartType: ChartType;
-  filterField: string; filterValue: string;
+  sortBy: 'dimension' | 'value'; sortField: string; chartType: ChartType;
+  filterField: string; filterValue: string; filterValues: string[];
 };
 type ChartPreviewRequest = ChartSpec & { limit: number };
 
@@ -64,6 +69,7 @@ const legacyChartSpecSchema = {
     table: textField, dimension: textField, measure: textField,
     aggregation: { type: 'string', enum: ['sum', 'avg', 'min', 'max', 'count'] },
     sortBy: { type: 'string', enum: ['dimension', 'value'] },
+    sortField: optionalTextField,
     chartType: { type: 'string', enum: ['bar', 'line', 'area', 'pie', 'donut', 'scatter', 'combo', 'heatmap', 'table'] },
     dateBucket: { type: 'string', enum: ['none', 'day', 'week', 'month', 'year'] },
     filterField: optionalTextField, filterValue: { type: 'string', maxLength: 500 },
@@ -98,13 +104,16 @@ const chartSpecV2Schema = {
       },
     },
     sortBy: { type: 'string', enum: ['dimension', 'value'] },
+    sortField: optionalTextField,
     chartType: { type: 'string', enum: ['bar', 'line', 'area', 'pie', 'donut', 'scatter', 'combo', 'heatmap', 'table'] },
-    filter: { type: 'object', additionalProperties: false, required: ['field', 'value'], properties: { field: textField, value: { type: 'string', maxLength: 500 } } },
+    filter: { type: 'object', additionalProperties: false, required: ['field'], properties: { field: textField, value: { type: 'string', maxLength: 500 }, values: { type: 'array', maxItems: 100, items: { type: 'string', maxLength: 500 } } }, anyOf: [{ required: ['value'] }, { required: ['values'] }] },
     displayTitle: { type: 'string', maxLength: 100 },
     valueFormat: { type: 'string', enum: ['number', 'currency', 'percent'] },
     currencyCode: { type: 'string', enum: ['USD', 'SGD', 'EUR', 'GBP'] },
     palette: { type: 'string', enum: ['sage', 'ocean', 'sunset', 'berry'] },
     showGrid: { type: 'boolean' }, showLegend: { type: 'boolean' },
+    showDataLabels: { type: 'boolean' }, smoothLines: { type: 'boolean' }, stackSeries: { type: 'boolean' },
+    alternateYCategories: { type: 'array', items: textField },
   },
 } as const;
 const chartSpecSchema = { anyOf: [chartSpecV2Schema, legacyChartSpecSchema] } as const;
@@ -277,7 +286,7 @@ app.post<{ Body: ChartPreviewRequest }>('/api/query/preview', {
   try {
     const { limit } = request.body;
     const spec = normalizeChartSpec(request.body);
-    const { table, xDimensions, yDimensions, measures, seriesDimensions, sortBy, chartType, dateBucket, filterField, filterValue } = spec;
+    const { table, xDimensions, yDimensions, measures, seriesDimensions, sortBy, sortField, chartType, dateBucket, filterField, filterValue, filterValues } = spec;
     const columns = await getColumns(table);
     if (!columns.length) return reply.code(404).send({ error: 'Table not found in this database.' });
     const xDimensionColumns = xDimensions.map((field) => columns.find((column) => column.name === field));
@@ -291,6 +300,7 @@ app.post<{ Body: ChartPreviewRequest }>('/api/query/preview', {
     if (measures.some((metric, index) => metric.aggregation !== 'count' && !isNumericType(measureColumns[index]!.type))) {
       return reply.code(400).send({ error: 'Each metric must be numeric unless its calculation is Count rows.' });
     }
+    if (sortField && !measures.some((metric) => metric.field === sortField)) return reply.code(400).send({ error: 'Choose a sort measure from the selected metrics.' });
     if (xDimensions.length > 0 && yDimensions.length > 0 && chartType !== 'heatmap' && chartType !== 'table') {
       return reply.code(400).send({ error: 'Two category axes need a heatmap or table chart.' });
     }
@@ -305,7 +315,7 @@ app.post<{ Body: ChartPreviewRequest }>('/api/query/preview', {
     if (dateBucket !== 'none' && !dimensionColumns.some((column) => isDateType(column!.type))) {
       return reply.code(400).send({ error: 'Date grouping is only available for date and timestamp fields on the X-axis.' });
     }
-    if (Boolean(filterField) !== Boolean(filterValue)) return reply.code(400).send({ error: 'Choose both a filter field and a filter value.' });
+    if (Boolean(filterField) !== Boolean(filterValues.length)) return reply.code(400).send({ error: 'Choose a filter field and at least one filter value.' });
     const filterColumn = filterField ? columns.find((column) => column.name === filterField) : undefined;
     if (filterField && !filterColumn) return reply.code(400).send({ error: 'Choose a filter field from the selected table.' });
 
@@ -327,8 +337,9 @@ app.post<{ Body: ChartPreviewRequest }>('/api/query/preview', {
       const expression = metric.aggregation === 'count' ? 'count()' : `${metric.aggregation}(${quoteIdentifier(measureColumns[index]!.name)})`;
       return `${expression} AS ${quoteIdentifier(metricAliases[index])}`;
     });
-    const order = sortBy === 'dimension' ? 'dimension ASC' : `${quoteIdentifier(metricAliases[0])} DESC`;
-    const filterSql = filterColumn ? ` WHERE toString(${quoteIdentifier(filterColumn.name)}) = {filterValue:String}` : '';
+    const sortMetricIndex = measures.findIndex((metric) => metric.field === sortField);
+    const order = sortBy === 'dimension' ? 'dimension ASC' : `${quoteIdentifier(metricAliases[sortMetricIndex >= 0 ? sortMetricIndex : 0])} DESC`;
+    const filterSql = filterColumn ? ` WHERE toString(${quoteIdentifier(filterColumn.name)}) IN (${filterValues.map((_, index) => `{filterValue${index}:String}`).join(', ')})` : '';
     const selectSeries = seriesColumns.length ? `, ${seriesSql} AS series` : '';
     const groupExpressions = [...xDimensionExpressions, ...yDimensionExpressions, ...seriesExpressions];
     const groupBy = groupExpressions.length ? ` GROUP BY ${groupExpressions.join(', ')}` : '';
@@ -336,7 +347,7 @@ app.post<{ Body: ChartPreviewRequest }>('/api/query/preview', {
     const query = `SELECT ${dimensionSql} AS dimension, ${xLabelSql} AS x_dimension, ${yLabelSql} AS y_dimension${dimensionFieldSelectSql}${selectSeries}, ${aggregates.join(', ')} FROM ${quoteIdentifier(database)}.${quoteIdentifier(table)}${filterSql}${groupBy} ORDER BY ${order}${seriesOrder} LIMIT {rowLimit:UInt32}`;
     const result = await clickhouse.query({
       query,
-      query_params: { rowLimit: limit, ...(filterColumn ? { filterValue } : {}) },
+      query_params: { rowLimit: limit, ...(filterColumn ? Object.fromEntries(filterValues.map((value, index) => [`filterValue${index}`, value])) : {}) },
       format: 'JSONEachRow',
       clickhouse_settings: { max_execution_time: 20 },
     });
@@ -369,9 +380,11 @@ function normalizeChartSpec(spec: ChartSpec): NormalizedSpec {
       measures: spec.encodings.y,
       seriesDimensions: explicitSeries,
       sortBy: spec.sortBy,
+      sortField: spec.sortField ?? spec.encodings.y[0]?.field ?? '',
       chartType: spec.chartType,
       filterField: spec.filter?.field ?? '',
       filterValue: spec.filter?.value ?? '',
+      filterValues: spec.filter?.values ?? (spec.filter?.value ? [spec.filter.value] : []),
     };
   }
   const legacy = spec as LegacyChartSpec;
@@ -383,9 +396,11 @@ function normalizeChartSpec(spec: ChartSpec): NormalizedSpec {
     measures: [{ field: legacy.measure, aggregation: legacy.aggregation }, ...(legacy.additionalMeasures ?? []).map((field) => ({ field, aggregation: legacy.aggregation }))],
     seriesDimensions: legacy.seriesDimension ? [legacy.seriesDimension] : [],
     sortBy: legacy.sortBy,
+    sortField: legacy.measure,
     chartType: legacy.chartType,
     filterField: legacy.filterField,
     filterValue: legacy.filterValue,
+    filterValues: legacy.filterValue ? [legacy.filterValue] : [],
   };
 }
 
@@ -401,6 +416,7 @@ function upgradeChartSpec(spec: ChartSpec): ChartSpecV2 {
       ...(legacy.seriesDimension ? { series: { field: legacy.seriesDimension } } : {}),
     },
     sortBy: legacy.sortBy,
+    sortField: legacy.measure,
     chartType: legacy.chartType,
     ...(legacy.filterField ? { filter: { field: legacy.filterField, value: legacy.filterValue } } : {}),
     displayTitle: legacy.displayTitle,
